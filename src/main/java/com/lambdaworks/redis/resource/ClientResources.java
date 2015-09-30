@@ -2,6 +2,10 @@ package com.lambdaworks.redis.resource;
 
 import java.util.concurrent.TimeUnit;
 
+import com.lambdaworks.redis.event.EventBus;
+import com.lambdaworks.redis.event.EventPublisherOptions;
+import com.lambdaworks.redis.metrics.CommandLatencyCollector;
+
 import io.netty.util.concurrent.EventExecutorGroup;
 import io.netty.util.concurrent.Future;
 
@@ -78,5 +82,26 @@ public interface ClientResources {
      * @return the pool size (number of threads to use).
      */
     int computationThreadPoolSize();
+
+    /**
+     * Returns the event bus used to publish events.
+     * 
+     * @return the event bus
+     */
+    EventBus eventBus();
+
+    /**
+     * Returns the {@link EventPublisherOptions} for latency event publishing.
+     * 
+     * @return the {@link EventPublisherOptions} for latency event publishing
+     */
+    EventPublisherOptions commandLatencyPublisherOptions();
+
+    /**
+     * Returns the {@link CommandLatencyCollector}.
+     * 
+     * @return the command latency collector
+     */
+    CommandLatencyCollector commandLatencyCollector();
 
 }

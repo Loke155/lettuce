@@ -5,13 +5,15 @@ import static com.lambdaworks.redis.resource.Futures.toBooleanPromise;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.Lists;
+import com.lambdaworks.redis.event.*;
+import com.lambdaworks.redis.event.metrics.DefaultCommandLatencyEventPublisher;
+import com.lambdaworks.redis.event.metrics.MetricEventPublisher;
+import com.lambdaworks.redis.metrics.CommandLatencyCollector;
+import com.lambdaworks.redis.metrics.CommandLatencyCollectorOptions;
+import com.lambdaworks.redis.metrics.DefaultCommandLatencyCollector;
+import com.lambdaworks.redis.metrics.DefaultCommandLatencyCollectorOptions;
 
-import io.netty.util.concurrent.DefaultEventExecutorGroup;
-import io.netty.util.concurrent.DefaultPromise;
-import io.netty.util.concurrent.EventExecutorGroup;
-import io.netty.util.concurrent.Future;
-import io.netty.util.concurrent.GlobalEventExecutor;
-import io.netty.util.concurrent.Promise;
+import io.netty.util.concurrent.*;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
@@ -29,6 +31,9 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
  * <li>computationThreadPoolSize</li>
  * <li>a {@code eventExecutorGroup} which is a provided instance of {@link EventExecutorGroup}. Higher precedence than
  * {@code computationThreadPoolSize}.</li>
+ * <li>an {@code eventBus} which is a provided instance of {@link EventBus}.</li>
+ * <li>a {@code commandLatencyCollector} which is a provided instance of
+ * {@link com.lambdaworks.redis.metrics.CommandLatencyCollector}.</li>
  * </ul>
  *
  * @author <a href="mailto:mpaluch@paluch.biz">Mark Paluch</a>
@@ -59,6 +64,11 @@ public class DefaultClientResources implements ClientResources {
     private final EventLoopGroupProvider eventLoopGroupProvider;
     private final boolean sharedEventExecutor;
     private final EventExecutorGroup eventExecutorGroup;
+    private final EventBus eventBus;
+    private final CommandLatencyCollector commandLatencyCollector;
+    private final boolean sharedCommandLatencyCollector;
+    private final EventPublisherOptions commandLatencyPublisherOptions;
+    private final MetricEventPublisher metricEventPublisher;
 
     private volatile boolean shutdownCalled = false;
 
@@ -98,6 +108,33 @@ public class DefaultClientResources implements ClientResources {
             eventExecutorGroup = builder.eventExecutorGroup;
         }
 
+        if (builder.eventBus == null) {
+            eventBus = new DefaultEventBus(new RxJavaEventExecutorGroupScheduler(eventExecutorGroup));
+        } else {
+            eventBus = builder.eventBus;
+        }
+
+        if (builder.commandLatencyCollector == null) {
+            if (builder.commandLatencyCollectorOptions != null) {
+                commandLatencyCollector = new DefaultCommandLatencyCollector(builder.commandLatencyCollectorOptions);
+            } else {
+                commandLatencyCollector = new DefaultCommandLatencyCollector(DefaultCommandLatencyCollectorOptions.create());
+            }
+            sharedCommandLatencyCollector = false;
+        } else {
+            sharedCommandLatencyCollector = true;
+            commandLatencyCollector = builder.commandLatencyCollector;
+        }
+
+        commandLatencyPublisherOptions = builder.commandLatencyPublisherOptions;
+
+        if (commandLatencyCollector.isEnabled() && commandLatencyPublisherOptions != null) {
+            metricEventPublisher = new DefaultCommandLatencyEventPublisher(eventExecutorGroup, commandLatencyPublisherOptions,
+                    eventBus, commandLatencyCollector);
+        } else {
+            metricEventPublisher = null;
+        }
+
     }
 
     /**
@@ -109,6 +146,10 @@ public class DefaultClientResources implements ClientResources {
         private int computationThreadPoolSize = DEFAULT_COMPUTATION_THREADS;
         private EventExecutorGroup eventExecutorGroup;
         private EventLoopGroupProvider eventLoopGroupProvider;
+        private EventBus eventBus;
+        private CommandLatencyCollectorOptions commandLatencyCollectorOptions = DefaultCommandLatencyCollectorOptions.create();
+        private CommandLatencyCollector commandLatencyCollector;
+        private EventPublisherOptions commandLatencyPublisherOptions = DefaultEventPublisherOptions.create();
 
         public Builder() {
         }
@@ -162,6 +203,52 @@ public class DefaultClientResources implements ClientResources {
          */
         public Builder eventExecutorGroup(EventExecutorGroup eventExecutorGroup) {
             this.eventExecutorGroup = eventExecutorGroup;
+            return this;
+        }
+
+        /**
+         * Sets the {@link EventBus} that can that can be used across different instances of the RedisClient.
+         *
+         * @param eventBus the event bus
+         * @return this
+         */
+        public Builder eventBus(EventBus eventBus) {
+            this.eventBus = eventBus;
+            return this;
+        }
+
+        /**
+         * Sets the {@link EventPublisherOptions} to publish command latency metrics using the {@link EventBus}.
+         *
+         * @param commandLatencyPublisherOptions the {@link EventPublisherOptions} to publish command latency metrics using the
+         *        {@link EventBus}.
+         * @return this
+         */
+        public Builder commandLatencyPublisherOptions(EventPublisherOptions commandLatencyPublisherOptions) {
+            this.commandLatencyPublisherOptions = commandLatencyPublisherOptions;
+            return this;
+        }
+
+        /**
+         * Sets the {@link CommandLatencyCollectorOptions} that can that can be used across different instances of the
+         * RedisClient. The options are only effective if no {@code commandLatencyCollector} is provided.
+         *
+         * @param commandLatencyCollectorOptions the command latency collector options
+         * @return this
+         */
+        public Builder commandLatencyCollectorOptions(CommandLatencyCollectorOptions commandLatencyCollectorOptions) {
+            this.commandLatencyCollectorOptions = commandLatencyCollectorOptions;
+            return this;
+        }
+
+        /**
+         * Sets the {@link CommandLatencyCollector} that can that can be used across different instances of the RedisClient.
+         *
+         * @param commandLatencyCollector the command latency collector
+         * @return this
+         */
+        public Builder commandLatencyCollector(CommandLatencyCollector commandLatencyCollector) {
+            this.commandLatencyCollector = commandLatencyCollector;
             return this;
         }
 
@@ -223,6 +310,10 @@ public class DefaultClientResources implements ClientResources {
 
         aggregator.arm();
 
+        if (metricEventPublisher != null) {
+            metricEventPublisher.shutdown();
+        }
+
         if (!sharedEventLoopGroupProvider) {
             Future<Boolean> shutdown = eventLoopGroupProvider.shutdown(quietPeriod, timeout, timeUnit);
             if (shutdown instanceof Promise) {
@@ -235,6 +326,10 @@ public class DefaultClientResources implements ClientResources {
         if (!sharedEventExecutor) {
             Future<?> shutdown = eventExecutorGroup.shutdownGracefully(quietPeriod, timeout, timeUnit);
             aggregator.add(toBooleanPromise(shutdown));
+        }
+
+        if (!sharedCommandLatencyCollector) {
+            commandLatencyCollector.shutdown();
         }
 
         aggregator.add(lastRelease);
@@ -263,10 +358,25 @@ public class DefaultClientResources implements ClientResources {
         return Lists.newArrayList(eventExecutorGroup.iterator()).size();
     }
 
+    @Override
+    public EventBus eventBus() {
+        return eventBus;
+    }
+
+    @Override
+    public CommandLatencyCollector commandLatencyCollector() {
+        return commandLatencyCollector;
+    }
+
+    @Override
+    public EventPublisherOptions commandLatencyPublisherOptions() {
+        return commandLatencyPublisherOptions;
+    }
+
     /**
      * Create a new {@link DefaultClientResources} using default settings.
      * 
-     * @return a new instance of a default client resources instance.
+     * @return a new instance of a default client resources.
      */
     public static DefaultClientResources create() {
         return new Builder().build();
